@@ -1,0 +1,54 @@
+package storage
+
+import (
+	"context"
+	"fmt"
+	"io"
+	"os"
+
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
+)
+
+type S3Storage struct {
+	Client *s3.Client
+	Bucket string
+}
+
+func NewS3Storage() (*S3Storage, error) {
+	region := os.Getenv("AWS_REGION")
+	bucket := os.Getenv("AWS_BUCKET")
+
+	// This one stays context.Background() — it runs ONCE at startup,
+	// not per-request, so there's no request context to thread here.
+
+	cfg, err := config.LoadDefaultConfig(context.Background(), config.WithRegion(region))
+	if err != nil {
+		return nil, err
+	}
+
+	client := s3.NewFromConfig(cfg)
+
+	return &S3Storage{
+		Client: client,
+		Bucket: bucket,
+	}, nil
+}
+
+// Save now takes ctx and forwards it to PutObject.
+func (s *S3Storage) Save(ctx context.Context, id string, data io.Reader) (string, error) {
+	key := fmt.Sprintf("documents/%s", id)
+
+	_, err := s.Client.PutObject(context.Background(), &s3.PutObjectInput{
+		Bucket: aws.String(s.Bucket),
+		Key:    aws.String(key),
+		Body:   data,
+	})
+
+	if err != nil {
+		return "", err
+	}
+
+	return key, nil
+}
