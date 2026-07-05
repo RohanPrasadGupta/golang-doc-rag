@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"log"
 	"net/http"
 	"os"
@@ -8,6 +9,7 @@ import (
 	"github.com/RohanPrasadGupta/golang-doc-rag/internal/config"
 	"github.com/RohanPrasadGupta/golang-doc-rag/internal/server"
 	"github.com/RohanPrasadGupta/golang-doc-rag/internal/storage"
+	"github.com/RohanPrasadGupta/golang-doc-rag/internal/vectordb"
 )
 
 func main() {
@@ -19,15 +21,18 @@ func main() {
 		log.Fatal("failed to create S3 storage:", err)
 	}
 
-	srv := server.NewServer(store)
+	vectorStore, err := vectordb.NewPinecone(context.Background())
+	if err != nil {
+		log.Fatal("failed to connect to Pinecone: ", err)
+	}
+
+	srv := server.NewServer(store, vectorStore)
 
 	port := os.Getenv("PORT")
 	if port == "" {
 		port = "8080"
 	}
 
-	// log.Fatal wraps ListenAndServe so a startup failure (e.g. port in use)
-	// is actually reported instead of silently exiting.
 	log.Printf("server starting on port %s", port)
 	log.Fatal(http.ListenAndServe(":"+port, srv))
 
