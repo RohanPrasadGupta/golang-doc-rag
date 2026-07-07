@@ -4,11 +4,13 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log"
 	"net/http"
 
 	"github.com/RohanPrasadGupta/golang-doc-rag/internal/chunk"
+	"github.com/RohanPrasadGupta/golang-doc-rag/internal/claude"
 	"github.com/RohanPrasadGupta/golang-doc-rag/internal/embed"
 	"github.com/RohanPrasadGupta/golang-doc-rag/internal/extract"
 	"github.com/RohanPrasadGupta/golang-doc-rag/internal/vectordb"
@@ -19,6 +21,9 @@ import (
 
 type Storage interface {
 	Save(ctx context.Context, id string, data io.Reader) (string, error)
+}
+type AskRequest struct {
+	UserQuestion string `json:"question"`
 }
 
 func NewServer(store Storage, vectorStore *vectordb.PineconeStore) *chi.Mux {
@@ -60,8 +65,6 @@ func NewServer(store Storage, vectorStore *vectordb.PineconeStore) *chi.Mux {
 			})
 			return
 		}
-
-		log.Printf("extracted %d characters", len(content))
 
 		chunks := chunk.SplitText(content, 1000, 200)
 
@@ -108,6 +111,77 @@ func NewServer(store Storage, vectorStore *vectordb.PineconeStore) *chi.Mux {
 		}
 
 		json.NewEncoder(w).Encode(response)
+	})
+
+	r.Post("/ask", func(w http.ResponseWriter, r *http.Request) {
+		var req AskRequest
+
+		err := json.NewDecoder(r.Body).Decode(&req)
+		if err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"Status":  http.StatusBadRequest,
+				"Message": "Invalid JSON body!",
+			})
+			return
+		}
+
+		if req.UserQuestion == "" {
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"Status":  http.StatusBadRequest,
+				"Message": "Question is required!",
+			})
+			return
+		}
+
+		fmt.Println("question:", req.UserQuestion)
+
+		embeddedQuestion, err := embed.EmbedTexts(r.Context(), []string{req.UserQuestion})
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"Status":  http.StatusInternalServerError,
+				"Message": "Failed to embed question!",
+			})
+			return
+		}
+
+		// fmt.Println("embededQuestion:", embededQuestion)
+
+		matches, err := vectorStore.Query(r.Context(), embeddedQuestion[0], 5)
+
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"Status":  http.StatusInternalServerError,
+				"Message": "Failed to fetch similar chunks!",
+			})
+			return
+		}
+		fmt.Println("matches:", matches)
+
+		combinedMatchesText := ""
+		for _, match := range matches {
+			combinedMatchesText += match.Text + "\n"
+		}
+
+		claudeResponse, err := claude.Query(r.Context(), req.UserQuestion, combinedMatchesText)
+
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"Status":  http.StatusInternalServerError,
+				"Message": "Failed to query Claude!",
+			})
+			return
+		}
+
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"Status":   http.StatusOK,
+			"Question": req.UserQuestion,
+			"Answer":   claudeResponse,
+		})
 	})
 
 	r.Get("/health", func(w http.ResponseWriter, r *http.Request) {

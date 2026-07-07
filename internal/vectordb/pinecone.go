@@ -15,6 +15,13 @@ type PineconeStore struct {
 	index  *pinecone.IndexConnection
 }
 
+type Match struct {
+	ID         string  `json:"id"`
+	Score      float32 `json:"score"`
+	Text       string  `json:"text"`
+	DocumentID string  `json:"document_id"`
+}
+
 func NewPinecone(ctx context.Context) (*PineconeStore, error) {
 	pineAPIKey := os.Getenv("PINECONE_API_KEY")
 	if pineAPIKey == "" {
@@ -90,4 +97,49 @@ func (p *PineconeStore) Upsert(
 
 	log.Printf("upserted %d vectors for document %s", count, documentID)
 	return nil
+}
+
+func (p *PineconeStore) Query(
+	ctx context.Context,
+	queryEmbedding []float64,
+	topK uint32,
+) ([]Match, error) {
+	values := make([]float32, len(queryEmbedding))
+
+	for i, v := range queryEmbedding {
+		values[i] = float32(v)
+	}
+
+	res, err := p.index.QueryByVectorValues(ctx, &pinecone.QueryByVectorValuesRequest{
+
+		Vector:          values,
+		TopK:            topK,
+		IncludeMetadata: true,
+		IncludeValues:   false,
+	})
+
+	if err != nil {
+
+		return nil, fmt.Errorf("query pinecone: %w", err)
+	}
+	matches := make([]Match, 0, len(res.Matches))
+
+	for _, m := range res.Matches {
+
+		match := Match{
+			ID:    m.Vector.Id,
+			Score: m.Score,
+		}
+		if m.Vector.Metadata != nil {
+			fields := m.Vector.Metadata.GetFields()
+			if textField, ok := fields["text"]; ok {
+				match.Text = textField.GetStringValue()
+			}
+			if docField, ok := fields["document_id"]; ok {
+				match.DocumentID = docField.GetStringValue()
+			}
+		}
+		matches = append(matches, match)
+	}
+	return matches, nil
 }

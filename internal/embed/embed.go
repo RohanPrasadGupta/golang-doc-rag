@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"log"
 	"net/http"
 	"os"
 )
@@ -90,7 +89,7 @@ func EmbedTexts(ctx context.Context, texts []string) ([][]float64, error) {
 
 		embeddings[item.Index] = item.Embedding
 	}
-	log.Printf("embedded %d chunks, first vector has %d dimensions", len(embeddings), len(embeddings[0]))
+	// log.Printf("embedded %d chunks, first vector has %d dimensions", len(embeddings), len(embeddings[0]))
 	// log.Printf("first vector: %v", embeddings[0])
 
 	return embeddings, nil
