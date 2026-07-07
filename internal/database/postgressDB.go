@@ -5,12 +5,21 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 type PostgresStore struct {
 	pool *pgxpool.Pool
+}
+
+type Document struct {
+	ID         string    `json:"id"`
+	Filename   string    `json:"filename"`
+	S3Path     string    `json:"s3_path"`
+	ChunkCount int       `json:"chunk_count"`
+	CreatedAt  time.Time `json:"created_at"`
 }
 
 func NewPostgres(ctx context.Context) (*PostgresStore, error) {
@@ -39,4 +48,30 @@ func (p *PostgresStore) SaveDocument(ctx context.Context, id, filename, s3Path s
 		return fmt.Errorf("insert document: %w", err)
 	}
 	return nil
+}
+
+func (p *PostgresStore) ListDocuments(ctx context.Context) ([]Document, error) {
+	rows, err := p.pool.Query(ctx,
+		`SELECT id, filename, s3_path, chunk_count, created_at
+		 FROM documents ORDER BY created_at DESC`)
+	if err != nil {
+		return nil, fmt.Errorf("query documents: %w", err)
+	}
+	defer rows.Close()
+
+	var documents []Document
+	for rows.Next() {
+		var doc Document
+		err := rows.Scan(&doc.ID, &doc.Filename, &doc.S3Path, &doc.ChunkCount, &doc.CreatedAt)
+		if err != nil {
+			return nil, fmt.Errorf("scan document: %w", err)
+		}
+		documents = append(documents, doc)
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate documents: %w", err)
+	}
+
+	return documents, nil
 }

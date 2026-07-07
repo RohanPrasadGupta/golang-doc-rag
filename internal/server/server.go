@@ -6,11 +6,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"log"
 	"net/http"
 
 	"github.com/RohanPrasadGupta/golang-doc-rag/internal/chunk"
 	"github.com/RohanPrasadGupta/golang-doc-rag/internal/claude"
+	"github.com/RohanPrasadGupta/golang-doc-rag/internal/database"
 	"github.com/RohanPrasadGupta/golang-doc-rag/internal/embed"
 	"github.com/RohanPrasadGupta/golang-doc-rag/internal/extract"
 	"github.com/RohanPrasadGupta/golang-doc-rag/internal/vectordb"
@@ -24,9 +24,10 @@ type Storage interface {
 }
 type AskRequest struct {
 	UserQuestion string `json:"question"`
+	DocumentID   string `json:"document_id,omitempty"`
 }
 
-func NewServer(store Storage, vectorStore *vectordb.PineconeStore) *chi.Mux {
+func NewServer(store Storage, vectorStore *vectordb.PineconeStore, postgresDB *database.PostgresStore) *chi.Mux {
 	r := chi.NewRouter()
 	r.Use(middleware.Logger)
 	r.Use(middleware.Recoverer)
@@ -78,8 +79,6 @@ func NewServer(store Storage, vectorStore *vectordb.PineconeStore) *chi.Mux {
 			return
 		}
 
-		log.Printf("embedded %d chunks", len(embeddings))
-
 		id := uuid.New().String() // generate a unique id for the file
 
 		if err := vectorStore.Upsert(r.Context(), id, chunks, embeddings); err != nil {
@@ -97,6 +96,16 @@ func NewServer(store Storage, vectorStore *vectordb.PineconeStore) *chi.Mux {
 			json.NewEncoder(w).Encode(map[string]interface{}{
 				"Status":  http.StatusInternalServerError,
 				"Message": "Failed to save file!",
+			})
+			return
+		}
+
+		err = postgresDB.SaveDocument(r.Context(), id, handler.Filename, path, len(chunks))
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"Status":  http.StatusInternalServerError,
+				"Message": "Failed to save document info!",
 			})
 			return
 		}
@@ -135,8 +144,6 @@ func NewServer(store Storage, vectorStore *vectordb.PineconeStore) *chi.Mux {
 			return
 		}
 
-		fmt.Println("question:", req.UserQuestion)
-
 		embeddedQuestion, err := embed.EmbedTexts(r.Context(), []string{req.UserQuestion})
 		if err != nil {
 			w.WriteHeader(http.StatusInternalServerError)
@@ -149,7 +156,7 @@ func NewServer(store Storage, vectorStore *vectordb.PineconeStore) *chi.Mux {
 
 		// fmt.Println("embededQuestion:", embededQuestion)
 
-		matches, err := vectorStore.Query(r.Context(), embeddedQuestion[0], 5)
+		matches, err := vectorStore.Query(r.Context(), embeddedQuestion[0], 5, req.DocumentID)
 
 		if err != nil {
 			w.WriteHeader(http.StatusInternalServerError)
@@ -181,6 +188,23 @@ func NewServer(store Storage, vectorStore *vectordb.PineconeStore) *chi.Mux {
 			"Status":   http.StatusOK,
 			"Question": req.UserQuestion,
 			"Answer":   claudeResponse,
+		})
+	})
+
+	r.Get("/documents", func(w http.ResponseWriter, r *http.Request) {
+		documents, err := postgresDB.ListDocuments(r.Context())
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"Status":  http.StatusInternalServerError,
+				"Message": "Failed to list documents!",
+			})
+			return
+		}
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"Status":    http.StatusOK,
+			"Message":   "Documents listed successfully!",
+			"Documents": documents,
 		})
 	})
 

@@ -103,6 +103,7 @@ func (p *PineconeStore) Query(
 	ctx context.Context,
 	queryEmbedding []float64,
 	topK uint32,
+	documentID string,
 ) ([]Match, error) {
 	values := make([]float32, len(queryEmbedding))
 
@@ -110,16 +111,25 @@ func (p *PineconeStore) Query(
 		values[i] = float32(v)
 	}
 
-	res, err := p.index.QueryByVectorValues(ctx, &pinecone.QueryByVectorValuesRequest{
-
+	req := &pinecone.QueryByVectorValuesRequest{
 		Vector:          values,
 		TopK:            topK,
 		IncludeMetadata: true,
-		IncludeValues:   false,
-	})
+	}
+
+	if documentID != "" {
+		filter, err := structpb.NewStruct(map[string]interface{}{
+			"document_id": documentID,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("build filter: %w", err)
+		}
+		req.MetadataFilter = filter
+	}
+
+	res, err := p.index.QueryByVectorValues(ctx, req)
 
 	if err != nil {
-
 		return nil, fmt.Errorf("query pinecone: %w", err)
 	}
 	matches := make([]Match, 0, len(res.Matches))

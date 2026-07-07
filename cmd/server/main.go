@@ -7,6 +7,7 @@ import (
 	"os"
 
 	"github.com/RohanPrasadGupta/golang-doc-rag/internal/config"
+	"github.com/RohanPrasadGupta/golang-doc-rag/internal/database"
 	"github.com/RohanPrasadGupta/golang-doc-rag/internal/server"
 	"github.com/RohanPrasadGupta/golang-doc-rag/internal/storage"
 	"github.com/RohanPrasadGupta/golang-doc-rag/internal/vectordb"
@@ -26,7 +27,12 @@ func main() {
 		log.Fatal("failed to connect to Pinecone: ", err)
 	}
 
-	srv := server.NewServer(store, vectorStore)
+	postgresDB, err := database.NewPostgres(context.Background())
+	if err != nil {
+		log.Fatal("failed to connect to Postgres: ", err)
+	}
+
+	srv := server.NewServer(store, vectorStore, postgresDB)
 
 	port := os.Getenv("PORT")
 	if port == "" {
