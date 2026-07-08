@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"fmt"
 	"io"
 	"net/http"
 
@@ -16,6 +15,7 @@ import (
 	"github.com/RohanPrasadGupta/golang-doc-rag/internal/vectordb"
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
+	"github.com/go-chi/cors"
 	"github.com/google/uuid"
 )
 
@@ -29,6 +29,15 @@ type AskRequest struct {
 
 func NewServer(store Storage, vectorStore *vectordb.PineconeStore, postgresDB *database.PostgresStore) *chi.Mux {
 	r := chi.NewRouter()
+
+	r.Use(cors.Handler(cors.Options{
+		AllowedOrigins:   []string{"http://localhost:5173"},
+		AllowedMethods:   []string{"GET", "POST", "OPTIONS"},
+		AllowedHeaders:   []string{"Content-Type"},
+		AllowCredentials: false,
+		MaxAge:           300,
+	}))
+
 	r.Use(middleware.Logger)
 	r.Use(middleware.Recoverer)
 
@@ -166,7 +175,6 @@ func NewServer(store Storage, vectorStore *vectordb.PineconeStore, postgresDB *d
 			})
 			return
 		}
-		fmt.Println("matches:", matches)
 
 		combinedMatchesText := ""
 		for _, match := range matches {
