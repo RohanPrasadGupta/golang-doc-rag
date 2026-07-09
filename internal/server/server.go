@@ -251,6 +251,24 @@ func NewServer(store Storage, vectorStore *vectordb.PineconeStore, postgresDB *d
 			return
 		}
 
+		const minScore = 0.3 // tune this — see note below
+
+		relevant := make([]vectordb.Match, 0, len(matches))
+		for _, m := range matches {
+			if m.Score >= minScore {
+				relevant = append(relevant, m)
+			}
+		}
+
+		if len(relevant) == 0 {
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"Status":   http.StatusOK,
+				"Question": req.UserQuestion,
+				"Answer":   "I couldn't find anything relevant in the uploaded documents.",
+			})
+			return
+		}
+
 		combinedMatchesText := ""
 		for _, match := range matches {
 			combinedMatchesText += match.Text + "\n"
