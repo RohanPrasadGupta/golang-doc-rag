@@ -153,3 +153,18 @@ func (p *PineconeStore) Query(
 	}
 	return matches, nil
 }
+
+func (p *PineconeStore) DeleteByDocumentIDPineCone(ctx context.Context, documentID string) error {
+	filter, err := structpb.NewStruct(map[string]interface{}{
+		"document_id": documentID,
+	})
+	if err != nil {
+		return fmt.Errorf("build delete filter: %w", err)
+	}
+
+	err = p.index.DeleteVectorsByFilter(ctx, filter)
+	if err != nil {
+		return fmt.Errorf("delete vectors by filter: %w", err)
+	}
+	return nil
+}

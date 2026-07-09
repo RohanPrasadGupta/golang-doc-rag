@@ -40,7 +40,7 @@ func NewS3Storage() (*S3Storage, error) {
 func (s *S3Storage) Save(ctx context.Context, id string, data io.Reader) (string, error) {
 	key := fmt.Sprintf("documents/%s", id)
 
-	_, err := s.Client.PutObject(context.Background(), &s3.PutObjectInput{
+	_, err := s.Client.PutObject(ctx, &s3.PutObjectInput{
 		Bucket: aws.String(s.Bucket),
 		Key:    aws.String(key),
 		Body:   data,
@@ -51,4 +51,15 @@ func (s *S3Storage) Save(ctx context.Context, id string, data io.Reader) (string
 	}
 
 	return key, nil
+}
+
+func (s *S3Storage) AwsS3DeleteDocumt(ctx context.Context, s3Path string) error {
+	_, err := s.Client.DeleteObject(ctx, &s3.DeleteObjectInput{
+		Bucket: aws.String(s.Bucket),
+		Key:    aws.String(s3Path),
+	})
+	if err != nil {
+		return err
+	}
+	return nil
 }

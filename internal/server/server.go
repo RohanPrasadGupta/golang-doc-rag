@@ -21,10 +21,16 @@ import (
 
 type Storage interface {
 	Save(ctx context.Context, id string, data io.Reader) (string, error)
+	AwsS3DeleteDocumt(ctx context.Context, s3Path string) error
 }
 type AskRequest struct {
 	UserQuestion string `json:"question"`
 	DocumentID   string `json:"document_id,omitempty"`
+}
+
+type DeleteRequest struct {
+	ID     string `json:"id"`
+	S3Path string `json:"s3_path"`
 }
 
 func NewServer(store Storage, vectorStore *vectordb.PineconeStore, postgresDB *database.PostgresStore) *chi.Mux {
@@ -32,7 +38,7 @@ func NewServer(store Storage, vectorStore *vectordb.PineconeStore, postgresDB *d
 
 	r.Use(cors.Handler(cors.Options{
 		AllowedOrigins:   []string{"http://localhost:5173"},
-		AllowedMethods:   []string{"GET", "POST", "OPTIONS"},
+		AllowedMethods:   []string{"GET", "POST", "DELETE", "OPTIONS"},
 		AllowedHeaders:   []string{"Content-Type"},
 		AllowCredentials: false,
 		MaxAge:           300,
@@ -131,6 +137,75 @@ func NewServer(store Storage, vectorStore *vectordb.PineconeStore, postgresDB *d
 		json.NewEncoder(w).Encode(response)
 	})
 
+	r.Get("/documents", func(w http.ResponseWriter, r *http.Request) {
+		documents, err := postgresDB.ListDocuments(r.Context())
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"Status":  http.StatusInternalServerError,
+				"Message": "Failed to list documents!",
+			})
+			return
+		}
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"Status":    http.StatusOK,
+			"Message":   "Documents listed successfully!",
+			"Documents": documents,
+		})
+	})
+
+	r.Delete("/documents", func(w http.ResponseWriter, r *http.Request) {
+
+		var req DeleteRequest
+
+		err := json.NewDecoder(r.Body).Decode(&req)
+		if err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"Status":  http.StatusBadRequest,
+				"Message": "Invalid JSON body!",
+			})
+			return
+		}
+
+		err = store.AwsS3DeleteDocumt(r.Context(), req.S3Path)
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"Status":  http.StatusInternalServerError,
+				"Message": "Failed to delete document from S3!",
+			})
+			return
+		}
+
+		err = postgresDB.DeleteDocument(r.Context(), req.ID)
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"Status":  http.StatusInternalServerError,
+				"Message": "Failed to delete document from database!",
+			})
+			return
+		}
+
+		err = vectorStore.DeleteByDocumentIDPineCone(r.Context(), req.ID)
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"Status":  http.StatusInternalServerError,
+				"Message": "Failed to delete document from Pinecone!",
+			})
+			return
+		}
+
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"Status":   http.StatusOK,
+			"Message":  "Document deleted successfully!",
+			"Document": req.ID,
+			"S3Path":   req.S3Path,
+		})
+	})
+
 	r.Post("/ask", func(w http.ResponseWriter, r *http.Request) {
 		var req AskRequest
 
@@ -196,23 +271,6 @@ func NewServer(store Storage, vectorStore *vectordb.PineconeStore, postgresDB *d
 			"Status":   http.StatusOK,
 			"Question": req.UserQuestion,
 			"Answer":   claudeResponse,
-		})
-	})
-
-	r.Get("/documents", func(w http.ResponseWriter, r *http.Request) {
-		documents, err := postgresDB.ListDocuments(r.Context())
-		if err != nil {
-			w.WriteHeader(http.StatusInternalServerError)
-			json.NewEncoder(w).Encode(map[string]interface{}{
-				"Status":  http.StatusInternalServerError,
-				"Message": "Failed to list documents!",
-			})
-			return
-		}
-		json.NewEncoder(w).Encode(map[string]interface{}{
-			"Status":    http.StatusOK,
-			"Message":   "Documents listed successfully!",
-			"Documents": documents,
 		})
 	})
 
