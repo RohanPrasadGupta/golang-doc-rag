@@ -7,8 +7,9 @@ import (
 )
 
 func LoadConfig() {
-	err := godotenv.Load()
-	if err != nil {
-		log.Fatal("Error loading .env file")
+	// In production (Render), there's no .env file — env vars are injected
+	// by the host. So a missing .env is fine; only log it, don't crash.
+	if err := godotenv.Load(); err != nil {
+		log.Println("no .env file found, using environment variables from the system")
 	}
 }
