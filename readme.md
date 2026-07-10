@@ -1,443 +1,584 @@
-# Golang Document RAG Service
+# Document RAG Backend (Go)
 
-A production-shaped **Retrieval-Augmented Generation (RAG)** service written entirely in **Go**. Upload a PDF, and the service extracts its text, splits it into chunks, embeds them, stores them in a vector database, and lets you ask natural-language questions that are answered by Claude using *only* the content of your documents.
+A Go backend that turns uploaded PDFs into a searchable knowledge base. Documents are extracted, chunked, embedded with Voyage AI, stored in Pinecone, and answered with Anthropic Claude — with metadata in PostgreSQL and original files in AWS S3.
 
-The whole pipeline is built from scratch — file storage, PDF text extraction, chunking, embeddings, vector search, metadata tracking, and LLM answering — wired together behind clean interfaces and dependency injection.
+**Author:** Rohan Prasad Gupta  
+**Language:** Go 1.25.6  
+**Purpose:** Portfolio project demonstrating RAG pipelines, vector search, cloud storage, and clean Go service design
 
 ---
 
-## What this project demonstrates
+## Table of Contents
 
-- Building a real backend service in Go with idiomatic project structure
-- Integrating **four external systems** (AWS S3, Voyage AI, Pinecone, PostgreSQL) plus the **Anthropic API**
-- The full RAG loop: **ingest → embed → retrieve → augment → generate**
-- Hand-rolling an HTTP client for a third-party API (Voyage, which has no Go SDK)
-- Using an official Go SDK where one exists (Pinecone) — knowing when to build vs. adopt
-- Writing raw SQL against Postgres with `pgx` (no ORM)
-- Vector-database **metadata filtering** to scope retrieval to a specific document
-- Dependency injection, the interface pattern, context propagation, and safe error handling
+- [Features](#features)
+- [Tech Stack](#tech-stack)
+- [Architecture](#architecture)
+- [File Structure](#file-structure)
+- [Environment Variables](#environment-variables)
+- [Getting Started](#getting-started)
+- [API Endpoints](#api-endpoints)
+- [Database Schema](#database-schema)
+- [Key Design Decisions](#key-design-decisions)
+- [Roadmap](#roadmap)
+
+---
+
+## Features
+
+- **PDF upload & indexing** — multipart upload extracts text, chunks it, embeds it, and stores vectors + metadata
+- **RAG Q&A** — ask questions over all documents or a single document via optional `document_id`
+- **Voyage AI embeddings** — `voyage-4-lite` for document and query vectors
+- **Pinecone vector search** — top-5 similarity retrieval with optional document filter and 0.3 minimum score
+- **Claude Haiku answers** — `claude-haiku-4-5` answers strictly from retrieved context
+- **Three-store persistence** — PostgreSQL (metadata), AWS S3 (raw PDFs), Pinecone (vectors)
+- **Document list & delete** — list uploaded docs; delete cleans S3, Postgres, and Pinecone
+- **CORS-ready** — allows local Vite (`localhost:5173`) and the Netlify frontend
+
+---
+
+## Tech Stack
+
+| Layer | Technology | Purpose |
+|---|---|---|
+| Language | Go 1.25.6 | Compiled HTTP service |
+| HTTP Router | Chi (`go-chi/chi/v5`) | Lightweight routing + middleware |
+| CORS | `go-chi/cors` | Frontend origin allowlist |
+| Database | PostgreSQL 17 + `pgx/v5` | Document metadata |
+| Object Storage | AWS S3 (`aws-sdk-go-v2`) | Raw PDF storage |
+| Vector DB | Pinecone (`go-pinecone/v3`) | Chunk embeddings + similarity search |
+| Embeddings | Voyage AI REST API | `voyage-4-lite` vectors |
+| LLM | Anthropic Claude SDK | `claude-haiku-4-5` answers |
+| PDF Extraction | Poppler `pdftotext` | PDF → plain text |
+| Env Loading | godotenv | Optional `.env` for local development |
+| Container | Docker + Compose | App image + local Postgres |
 
 ---
 
 ## Architecture
 
-The service has two core flows: **ingestion** (when a document is uploaded) and **query** (when a question is asked).
-
-### Ingestion flow
-
 ```
-   PDF upload
-       │
-       ▼
-   Go API  ──────────────►  AWS S3        (store the raw PDF)
-       │
-       ├──►  pdftotext      (extract plain text from the PDF)
-       │
-       ├──►  Chunker        (split text into overlapping chunks)
-       │
-       ├──►  Voyage AI      (embed each chunk into a 1024-dim vector)
-       │
-       ├──►  Pinecone       (store vectors + metadata: text, document_id)
-       │
-       └──►  PostgreSQL     (record document metadata: id, filename, path, chunk count)
-```
-
-### Query flow
-
-```
-   Question (+ optional document_id)
-       │
-       ▼
-   Go API
-       │
-       ├──►  Voyage AI      (embed the question)
-       │
-       ├──►  Pinecone       (find top-K nearest chunks; optionally filtered by document_id)
-       │
-       ├──►  Build prompt   (retrieved chunks as context + the question)
-       │
-       └──►  Claude         (answer using ONLY the provided context)
-       │
-       ▼
-   JSON answer
+┌─────────────────────────────────────────────────────────────┐
+│  Client (Browser / API Consumer)                            │
+│  localhost:5173  ·  golang-doc-ai.netlify.app               │
+└────────────────────────────┬────────────────────────────────┘
+                             │  HTTP
+                             ↓
+┌─────────────────────────────────────────────────────────────┐
+│  Chi HTTP Server (PORT, default 8080)                       │
+│                                                             │
+│  Routes:                                                    │
+│    GET    /health                                           │
+│    POST   /documents     (upload + index PDF)               │
+│    GET    /documents     (list metadata)                    │
+│    DELETE /documents     (S3 + Postgres + Pinecone)         │
+│    POST   /ask           (RAG question answering)           │
+└──────┬──────────────┬──────────────┬──────────────┬─────────┘
+       │              │              │              │
+       ↓              ↓              ↓              ↓
+┌────────────┐ ┌────────────┐ ┌────────────┐ ┌──────────────┐
+│ PostgreSQL │ │  AWS S3    │ │  Pinecone  │ │ Voyage AI +  │
+│ documents  │ │ documents/ │ │ chunk      │ │ Claude Haiku │
+│ metadata   │ │ {uuid}     │ │ vectors    │ │              │
+└────────────┘ └────────────┘ └────────────┘ └──────────────┘
 ```
 
-### Why two AI providers?
+### Upload pipeline (`POST /documents`)
 
-Anthropic's API does **generation** (answering), not **embeddings**. Embeddings — turning text into vectors — are handled by **Voyage AI** (Anthropic's recommended embedding provider). So the stack deliberately splits responsibilities:
+```
+multipart file "file"
+        ↓
+  pdftotext (Poppler)
+        ↓
+  chunk.SplitText(size=1000, overlap=200)
+        ↓
+  Voyage embed chunks (voyage-4-lite)
+        ↓
+  Pinecone Upsert  →  vectors: {document_id}-{index}
+        ↓
+  S3 PutObject     →  key: documents/{uuid}
+        ↓
+  Postgres INSERT  →  documents table
+        ↓
+  JSON response (ID, File, Size, Path)
+```
 
-- **Voyage AI** → embeds text into vectors (for retrieval)
-- **Claude (Anthropic)** → generates the final answer (from retrieved context)
+### Ask pipeline (`POST /ask`)
 
-The single generated **UUID** for each document ties all three storage systems together: the row in Postgres, the object in S3 (`documents/<uuid>`), and the vectors in Pinecone (`<uuid>-0`, `<uuid>-1`, …).
+```
+{"question": "...", "document_id": "optional"}
+        ↓
+  Embed question (Voyage)
+        ↓
+  Pinecone Query (topK=5, optional document_id filter)
+        ↓
+  Keep matches with score >= 0.3
+        ↓
+  Claude Haiku (context = retrieved chunk text)
+        ↓
+  {"Status", "Question", "Answer"}
+```
 
 ---
 
-## Tech stack
-
-| Layer                | Technology                              | Purpose                                          |
-| -------------------- | --------------------------------------- | ------------------------------------------------ |
-| Language             | Go                                      | API server and all orchestration logic           |
-| HTTP router          | `go-chi/chi`                            | Lightweight, idiomatic routing + middleware      |
-| Raw file storage     | AWS S3                                  | Stores the original uploaded PDFs                |
-| Text extraction      | `pdftotext` (Poppler) via `os/exec`     | Extracts plain text from PDFs                    |
-| Embeddings           | Voyage AI (`voyage-4-lite`)             | Turns text chunks into 1024-dim vectors          |
-| Vector database      | Pinecone                                | Stores vectors, performs similarity search       |
-| Metadata store       | PostgreSQL (via `pgx`)                  | Tracks which documents exist                     |
-| LLM                  | Anthropic Claude (`claude-haiku-4-5`)   | Answers questions from retrieved context         |
-
----
-
-## Project structure
+## File Structure
 
 ```
 golang-doc-rag/
 ├── cmd/
 │   └── server/
-│       └── main.go              # entry point — wires up all dependencies, starts the server
+│       └── main.go                 # Entry: config, S3, Pinecone, Postgres, HTTP listen
 ├── internal/
 │   ├── config/
-│   │   └── config.go            # loads environment variables from .env
+│   │   └── config.go               # Optional godotenv.Load() for local .env
 │   ├── server/
-│   │   └── server.go            # chi router + all HTTP handlers
-│   ├── storage/
-│   │   └── s3.go                # S3Storage — saves raw PDFs (implements the Storage interface)
-│   ├── extract/
-│   │   └── extract.go           # ExtractText — shells out to pdftotext
-│   ├── chunk/
-│   │   └── chunk.go             # SplitText — rune-safe overlapping chunking
-│   ├── embed/
-│   │   └── embed.go             # EmbedTexts — hand-rolled Voyage AI HTTP client
-│   ├── vectordb/
-│   │   └── pinecone.go          # PineconeStore — Upsert + Query (with metadata filtering)
+│   │   └── server.go               # Chi router + all HTTP handlers
 │   ├── database/
-│   │   └── postgres.go          # PostgresStore — SaveDocument + ListDocuments
+│   │   └── postgressDB.go          # pgx pool, documents CRUD
+│   ├── storage/
+│   │   ├── s3.go                   # AWS S3 upload / delete (wired in main)
+│   │   └── local.go                # Local filesystem storage (not wired)
+│   ├── extract/
+│   │   └── extract.go              # PDF → text via pdftotext
+│   ├── chunk/
+│   │   └── chunk.go                # Rune-based sliding-window chunking
+│   ├── embed/
+│   │   └── embed.go                # Voyage AI embeddings client
+│   ├── vectordb/
+│   │   └── pinecone.go             # Pinecone upsert / query / delete-by-filter
 │   └── claude/
-│       └── claudeQuery.go       # Query — calls the Anthropic API to generate answers
-├── docker-compose.yml           # local PostgreSQL
-├── .env                         # your secrets (NOT committed)
-├── .env.example                 # documents which env vars are required
-├── go.mod
-└── go.sum
-```
-
-The `internal/` directory uses Go's enforced privacy: packages under `internal/` can only be imported within this module, keeping the codebase cleanly separated.
-
----
-
-## How it works, step by step
-
-### 1. Upload (`POST /documents`)
-
-1. The handler reads the uploaded file from the multipart form.
-2. The raw bytes are read once into memory and reused (so both S3 and extraction get the same content without re-reading the stream).
-3. **Text extraction** — the bytes are written to a temp file and `pdftotext` is invoked via `os/exec` to pull out plain text. (`pdftotext` is far more robust than pure-Go PDF libraries, which often return empty text on real-world PDFs.)
-4. **Chunking** — the text is split into overlapping chunks (1000 characters wide, 200-character overlap). Overlap prevents facts near a chunk boundary from being split and lost. Chunking operates on `[]rune`, not raw bytes, so multi-byte UTF-8 characters are never cut in half.
-5. **Embedding** — all chunks are sent to Voyage AI in one batched call, returning one 1024-dim vector per chunk.
-6. **Vector storage** — each vector is upserted into Pinecone with a unique ID (`<uuid>-<index>`) and metadata (`text`, `document_id`).
-7. **S3 storage** — the raw PDF is saved to S3 under `documents/<uuid>`.
-8. **Metadata** — a row is inserted into Postgres recording the document.
-
-### 2. Ask (`POST /ask`)
-
-1. The question is embedded via Voyage.
-2. Pinecone is queried for the top-5 most similar chunks. If a `document_id` is provided, a **metadata filter** scopes the search to that single document.
-3. The retrieved chunk texts are pulled from the vectors' metadata and combined into a context block.
-4. Claude is called with a system prompt instructing it to answer using **only** the provided context (an anti-hallucination guardrail), and the answer is returned.
-
-### 3. List (`GET /documents`)
-
-Returns all uploaded documents from Postgres, newest first.
-
----
-
-## API reference
-
-### `GET /health`
-
-Health check.
-
-**Response**
-```json
-{ "Status": 200, "Message": "Server is running!" }
-```
-
-### `POST /documents`
-
-Upload a PDF. Body is `multipart/form-data` with a field named `file`.
-
-**Example (curl)**
-```bash
-curl -F "file=@/path/to/document.pdf" http://localhost:8080/documents
-```
-
-**Response**
-```json
-{
-  "Status": 200,
-  "Message": "File uploaded successfully!",
-  "ID": "7ee9e3fd-3950-4004-ae08-58fe6ba3a638",
-  "File": "document.pdf",
-  "Size": 157593,
-  "Path": "documents/7ee9e3fd-3950-4004-ae08-58fe6ba3a638"
-}
-```
-
-### `GET /documents`
-
-List all uploaded documents.
-
-**Response**
-```json
-{
-  "Status": 200,
-  "Message": "Documents listed successfully!",
-  "Documents": [
-    {
-      "id": "7ee9e3fd-3950-4004-ae08-58fe6ba3a638",
-      "filename": "document.pdf",
-      "s3_path": "documents/7ee9e3fd-3950-4004-ae08-58fe6ba3a638",
-      "chunk_count": 12,
-      "created_at": "2026-07-08T00:16:41.476403+07:00"
-    }
-  ]
-}
-```
-
-### `POST /ask`
-
-Ask a question. Body is JSON.
-
-| Field         | Type   | Required | Description                                            |
-| ------------- | ------ | -------- | ------------------------------------------------------ |
-| `question`    | string | yes      | The natural-language question                          |
-| `document_id` | string | no       | If set, retrieval is scoped to this one document only  |
-
-**Example — ask across all documents**
-```bash
-curl -X POST http://localhost:8080/ask \
-  -H "Content-Type: application/json" \
-  -d '{"question": "What are the AWS certifications?"}'
-```
-
-**Example — ask scoped to one document**
-```bash
-curl -X POST http://localhost:8080/ask \
-  -H "Content-Type: application/json" \
-  -d '{
-    "question": "Where did they study?",
-    "document_id": "7ee9e3fd-3950-4004-ae08-58fe6ba3a638"
-  }'
-```
-
-**Response**
-```json
-{
-  "Status": 200,
-  "Question": "Where did they study?",
-  "Answer": "Based on the retrieved document, they studied at ..."
-}
+│       └── claudeQuery.go          # Anthropic Messages API for RAG answers
+├── docker-compose.yml              # Local PostgreSQL 17
+├── Dockerfile                      # Multi-stage build + poppler-utils
+├── go.mod / go.sum
+├── .env                            # Local secrets (never commit)
+├── .gitignore
+└── README.md
 ```
 
 ---
 
-## Getting started
+## Environment Variables
+
+Create a `.env` in the project root for local development. In production (e.g. Render), inject the same variables in the host — a missing `.env` file is fine.
+
+```env
+# Server
+PORT=8080
+
+# PostgreSQL
+POSTGRES_DATABASE_URL=postgres://postgres:postgres@localhost:5432/docrag?sslmode=disable
+
+# AWS S3
+AWS_REGION=ap-southeast-1
+AWS_BUCKET=your-bucket-name
+AWS_ACCESS_KEY_ID=your-access-key
+AWS_SECRET_ACCESS_KEY=your-secret-key
+
+# Pinecone
+PINECONE_API_KEY=pcsk_...
+PINECONE_HOST=https://your-index-xxxx.svc.region.pinecone.io
+
+# Voyage AI
+VOYAGE_API_KEY=pa-...
+
+# Anthropic
+ANTHROPIC_API_KEY=sk-ant-...
+```
+
+| Variable | Required | Purpose |
+|---|---|---|
+| `PORT` | No (default `8080`) | HTTP listen port |
+| `POSTGRES_DATABASE_URL` | Yes | Postgres connection string |
+| `AWS_REGION` | Yes | S3 region |
+| `AWS_BUCKET` | Yes | S3 bucket name |
+| `AWS_ACCESS_KEY_ID` | Yes* | AWS credentials (*or IAM role) |
+| `AWS_SECRET_ACCESS_KEY` | Yes* | AWS credentials (*or IAM role) |
+| `PINECONE_API_KEY` | Yes | Pinecone auth |
+| `PINECONE_HOST` | Yes | Pinecone index host URL |
+| `VOYAGE_API_KEY` | Yes | Voyage embeddings API |
+| `ANTHROPIC_API_KEY` | Yes | Claude API |
+
+**Pinecone index:** Create an index whose dimension matches `voyage-4-lite` before starting the server.
+
+---
+
+## Getting Started
 
 ### Prerequisites
 
-- **Go** 1.22+ ([install](https://go.dev/dl/))
-- **Docker** (for local PostgreSQL) ([install](https://docs.docker.com/get-docker/))
-- **Poppler** (provides the `pdftotext` binary)
-  - macOS: `brew install poppler`
-  - Ubuntu/Debian: `sudo apt-get install poppler-utils`
-- Accounts / keys for:
-  - **AWS** — an S3 bucket + credentials
-  - **Voyage AI** — a free API key ([voyageai.com](https://www.voyageai.com/)); the free tier is generous
-  - **Pinecone** — a free account + a serverless index ([pinecone.io](https://www.pinecone.io/))
-  - **Anthropic** — an API key ([console.anthropic.com](https://console.anthropic.com/))
+- Go 1.25+ (matches `go.mod`)
+- Docker Desktop (for PostgreSQL)
+- Poppler (`pdftotext`) on your PATH for local runs  
+  - macOS: `brew install poppler`  
+  - Linux: `apt install poppler-utils`
+- Accounts / resources: AWS S3 bucket, Pinecone index, Voyage AI key, Anthropic key
 
-### 1. Clone the repository
+### Setup
+
+**1. Clone the repository**
 
 ```bash
 git clone https://github.com/RohanPrasadGupta/golang-doc-rag.git
 cd golang-doc-rag
 ```
 
-### 2. Install Go dependencies
+**2. Install Go dependencies**
 
 ```bash
-go mod tidy
+go mod download
 ```
 
-### 3. Create the Pinecone index
-
-In the Pinecone console, create a **serverless** index with:
-
-- **Dimension:** `1024` (must match the `voyage-4-lite` embedding size)
-- **Metric:** `cosine`
-- **Cloud/region:** any (e.g. AWS `us-east-1`)
-
-Copy the index **host URL** (looks like `https://<index>-<id>.svc.<region>.pinecone.io`) — you'll need it below.
-
-### 4. Set up environment variables
-
-Copy the example file and fill in your values:
-
-```bash
-cp .env.example .env
-```
-
-Your `.env` should contain:
-
-```env
-# Server
-PORT=8080
-
-# AWS S3
-AWS_REGION=us-east-1
-AWS_BUCKET=your-bucket-name
-AWS_ACCESS_KEY_ID=your-access-key
-AWS_SECRET_ACCESS_KEY=your-secret-key
-
-# Voyage AI (embeddings)
-VOYAGE_API_KEY=your-voyage-key
-
-# Pinecone (vector database)
-PINECONE_API_KEY=your-pinecone-key
-PINECONE_HOST=https://your-index-host.pinecone.io
-
-# Anthropic (Claude)
-ANTHROPIC_API_KEY=your-anthropic-key
-
-# PostgreSQL
-POSTGRES_DATABASE_URL=postgres://postgres:postgres@localhost:5432/docrag
-```
-
-> **Note:** AWS credentials can also be supplied via the standard AWS mechanisms (`~/.aws/credentials`, IAM roles, etc.) — the code uses `config.LoadDefaultConfig`, which picks them up automatically.
-
-### 5. Start PostgreSQL
+**3. Start PostgreSQL**
 
 ```bash
 docker compose up -d
+docker compose ps
 ```
 
-Wait until it reports healthy:
+**4. Create the `documents` table** (no auto-migration in the app)
 
 ```bash
-docker compose ps    # look for "healthy"
-```
-
-### 6. Create the database schema
-
-Connect to the running database and create the `documents` table:
-
-```bash
-docker exec -it rag-postgres psql -U postgres -d docrag
-```
-
-Then run:
-
-```sql
-CREATE TABLE documents (
-    id          UUID PRIMARY KEY,
+psql "postgres://postgres:postgres@localhost:5432/docrag?sslmode=disable" <<'SQL'
+CREATE TABLE IF NOT EXISTS documents (
+    id          TEXT PRIMARY KEY,
     filename    TEXT NOT NULL,
     s3_path     TEXT NOT NULL,
-    chunk_count INTEGER NOT NULL,
-    created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+    chunk_count INTEGER NOT NULL DEFAULT 0,
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+SQL
 ```
 
-Type `\q` to exit.
+**5. Create your `.env`** (see [Environment Variables](#environment-variables))
 
-### 7. Run the server
+**6. Run the server**
 
 ```bash
-go run cmd/server/main.go
+go run ./cmd/server
 ```
 
-On a successful start you should see something like:
+You should see logs similar to:
 
 ```
-connected to Pinecone: 0 vectors in index
+connected to Pinecone: N vectors in index
 connected to Postgres
 server starting on port 8080
 ```
 
-### 8. Try it out
+**7. Verify health**
 
 ```bash
-# Upload a PDF
-curl -F "file=@resume.pdf" http://localhost:8080/documents
+curl http://localhost:8080/health
+```
 
-# List documents
+```json
+{
+  "Status": 200,
+  "Message": "Server is running!"
+}
+```
+
+### Run with Docker
+
+```bash
+docker build -t golang-doc-rag .
+docker run -p 8080:8080 --env-file .env golang-doc-rag
+```
+
+The image installs `poppler-utils` so PDF extraction works inside the container. Postgres still runs via `docker compose` (or a managed instance).
+
+---
+
+## API Endpoints
+
+All routes are root-level (no `/api` prefix). Success/error JSON often uses PascalCase keys (`Status`, `Message`).
+
+### 1. Health Check
+
+**Request:**
+
+```bash
+curl http://localhost:8080/health
+```
+
+**Response `200`:**
+
+```json
+{
+  "Status": 200,
+  "Message": "Server is running!"
+}
+```
+
+---
+
+### 2. Upload a Document
+
+Upload a PDF. The server extracts text, chunks it (1000 runes, 200 overlap), embeds with Voyage, upserts to Pinecone, saves the file to S3, and inserts metadata into Postgres.
+
+**Request:**
+
+```bash
+curl -X POST http://localhost:8080/documents \
+  -F "file=@/path/to/report.pdf"
+```
+
+**Response `200`:**
+
+```json
+{
+  "Status": 200,
+  "Message": "File uploaded successfully!",
+  "ID": "550e8400-e29b-41d4-a716-446655440000",
+  "File": "report.pdf",
+  "Size": 123456,
+  "Path": "documents/550e8400-e29b-41d4-a716-446655440000"
+}
+```
+
+**Errors:**
+
+| Status | Message |
+|---|---|
+| 400 | `Failed to get file!` |
+| 400 | `Failed to extract PDF text!` |
+| 500 | `Failed to read file!` |
+| 500 | `Failed to embed chunks!` |
+| 500 | `Failed to store vectors!` |
+| 500 | `Failed to save file!` |
+| 500 | `Failed to save document info!` |
+
+---
+
+### 3. List Documents
+
+**Request:**
+
+```bash
 curl http://localhost:8080/documents
+```
 
-# Ask a question (use an ID from the list above to scope it)
+**Response `200`:**
+
+```json
+{
+  "Status": 200,
+  "Message": "Documents listed successfully!",
+  "Documents": [
+    {
+      "id": "550e8400-e29b-41d4-a716-446655440000",
+      "filename": "report.pdf",
+      "s3_path": "documents/550e8400-e29b-41d4-a716-446655440000",
+      "chunk_count": 42,
+      "created_at": "2026-07-10T09:00:00Z"
+    }
+  ]
+}
+```
+
+**Error `500`:** `Failed to list documents!`
+
+---
+
+### 4. Delete a Document
+
+Removes the object from S3, the row from Postgres, then vectors from Pinecone (by `document_id` metadata filter).
+
+**Request:**
+
+```bash
+curl -X DELETE http://localhost:8080/documents \
+  -H "Content-Type: application/json" \
+  -d '{
+    "id": "550e8400-e29b-41d4-a716-446655440000",
+    "s3_path": "documents/550e8400-e29b-41d4-a716-446655440000"
+  }'
+```
+
+**Response `200`:**
+
+```json
+{
+  "Status": 200,
+  "Message": "Document deleted successfully!",
+  "Document": "550e8400-e29b-41d4-a716-446655440000",
+  "S3Path": "documents/550e8400-e29b-41d4-a716-446655440000"
+}
+```
+
+**Errors:**
+
+| Status | Message |
+|---|---|
+| 400 | `Invalid JSON body!` |
+| 500 | `Failed to delete document from S3!` |
+| 500 | `Failed to delete document from database!` |
+| 500 | `Failed to delete document from Pinecone!` |
+
+---
+
+### 5. Ask a Question (RAG)
+
+Embeds the question, retrieves the top 5 similar chunks from Pinecone (optionally scoped to one document), and asks Claude to answer using that context only.
+
+**Request (all documents):**
+
+```bash
 curl -X POST http://localhost:8080/ask \
   -H "Content-Type: application/json" \
-  -d '{"question": "Summarize this document."}'
+  -d '{"question": "What is the main conclusion of the report?"}'
 ```
 
----
-
-## Docker Compose (PostgreSQL)
-
-The included `docker-compose.yml` runs a local Postgres with a persistent volume:
-
-```yaml
-services:
-  postgres:
-    image: postgres:17
-    container_name: rag-postgres
-    restart: unless-stopped
-    environment:
-      POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: postgres
-      POSTGRES_DB: docrag
-    ports:
-      - "5432:5432"
-    volumes:
-      - rag-pgdata:/var/lib/postgresql/data
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres -d docrag"]
-      interval: 5s
-      timeout: 5s
-      retries: 5
-
-volumes:
-  rag-pgdata:
-```
-
-Useful commands:
+**Request (single document):**
 
 ```bash
-docker compose up -d       # start
-docker compose ps          # status
-docker compose logs -f     # logs
-docker compose down        # stop (data survives in the volume)
-docker compose down -v     # stop AND wipe the data volume
+curl -X POST http://localhost:8080/ask \
+  -H "Content-Type: application/json" \
+  -d '{
+    "question": "What is the main conclusion of the report?",
+    "document_id": "550e8400-e29b-41d4-a716-446655440000"
+  }'
 ```
+
+**Response `200` (answer found):**
+
+```json
+{
+  "Status": 200,
+  "Question": "What is the main conclusion of the report?",
+  "Answer": "Based on the uploaded documents, the main conclusion is..."
+}
+```
+
+**Response `200` (nothing relevant, score &lt; 0.3):**
+
+```json
+{
+  "Status": 200,
+  "Question": "What is the main conclusion of the report?",
+  "Answer": "I couldn't find anything relevant in the uploaded documents."
+}
+```
+
+**Errors:**
+
+| Status | Message |
+|---|---|
+| 400 | `Invalid JSON body!` |
+| 400 | `Question is required!` |
+| 500 | `Failed to embed question!` |
+| 500 | `Failed to fetch similar chunks!` |
+| 500 | `Failed to query Claude!` |
 
 ---
 
-## Design decisions & notes
+## Database Schema
 
-- **`pdftotext` over pure-Go PDF libraries.** Pure-Go extractors frequently return empty text on real-world PDFs (non-standard font encodings). Shelling out to the battle-tested `pdftotext` handles nearly any PDF. Arguments are passed to `os/exec` separately (never concatenated into a shell string), so filenames with spaces or special characters can't cause injection.
-- **Rune-based chunking.** Go strings are byte sequences, so slicing by byte index can split a multi-byte UTF-8 character in half. Chunking on `[]rune` avoids this.
-- **Interface for storage.** `S3Storage` implements a `Storage` interface, so the storage backend could be swapped (e.g. for local disk or a mock in tests) without changing the handler code.
-- **Hand-rolled Voyage client, official Pinecone SDK.** Voyage has no Go SDK, so its client is built directly with `net/http` and JSON structs. Pinecone has an official SDK, which is used instead of reimplementing its API — demonstrating judgment about when to build vs. adopt.
-- **Context propagation.** The request's `context.Context` is threaded through I/O calls, so a client disconnect can cancel in-flight work.
-- **Anti-hallucination prompt.** Claude is instructed to answer using only the retrieved context and to say so when the answer isn't present — which is what makes this a true RAG system rather than a general chatbot.
+### `documents` table (PostgreSQL)
 
-### Known limitations / future work
+| Column | Type | Notes |
+|---|---|---|
+| `id` | `TEXT` | Primary key (UUID string from Go) |
+| `filename` | `TEXT` | Original upload filename |
+| `s3_path` | `TEXT` | S3 key, e.g. `documents/{id}` |
+| `chunk_count` | `INTEGER` | Number of chunks / vectors upserted |
+| `created_at` | `TIMESTAMPTZ` | Default `NOW()` |
 
-- **Distributed consistency.** Uploads write to S3, Pinecone, and Postgres in sequence with no shared transaction. A failure partway through can leave orphaned data (e.g. vectors with no Postgres record). A production system would address this with compensating cleanup or an outbox pattern.
-- **No authentication** on the endpoints.
-- **Schema is created manually**; a proper migration tool would be the next step.
-- **No streaming** of Claude responses yet (answers return all at once).
+Go struct (`internal/database/postgressDB.go`):
+
+```go
+type Document struct {
+    ID         string    `json:"id"`
+    Filename   string    `json:"filename"`
+    S3Path     string    `json:"s3_path"`
+    ChunkCount int       `json:"chunk_count"`
+    CreatedAt  time.Time `json:"created_at"`
+}
+```
+
+### Pinecone vectors
+
+| Field | Value |
+|---|---|
+| Vector ID | `{document_id}-{chunk_index}` |
+| Metadata `text` | Chunk content |
+| Metadata `document_id` | Parent document UUID |
+
+### S3 layout
+
+| Key | Content |
+|---|---|
+| `documents/{uuid}` | Raw uploaded PDF bytes |
+
+---
+
+## Key Design Decisions
+
+### Why Chi instead of a heavier framework?
+
+Chi is a thin, idiomatic router on top of `net/http`. Middleware (logger, recoverer, CORS) composes cleanly without pulling in an ORM or DI framework.
+
+### Why three stores (Postgres + S3 + Pinecone)?
+
+Each store owns one concern:
+
+- **Postgres** — listable document metadata for the UI
+- **S3** — durable original files
+- **Pinecone** — similarity search over chunk embeddings
+
+### Why Poppler `pdftotext`?
+
+Reliable CLI extraction with stdin/stdout (`pdftotext - -`). The Docker image installs `poppler-utils` so production does not depend on a Go PDF library.
+
+### Why chunk size 1000 / overlap 200?
+
+Rune-based sliding windows keep chunks roughly model-friendly while overlap preserves context across boundaries. Step size is `800` runes (`1000 - 200`).
+
+### Why Voyage + Claude?
+
+Voyage specializes in embeddings; Claude Haiku is fast and cheap for grounded Q&A. The system prompt forces answers from retrieved context only — no outside knowledge.
+
+### Why optional `document_id` on `/ask`?
+
+Supports both “search everything” and “chat with this PDF” UX without separate endpoints. Pinecone applies a metadata filter when `document_id` is set.
+
+### Why score threshold 0.3?
+
+Low-similarity matches are treated as irrelevant so Claude is not asked to invent answers from weak retrieval. Tunable in `server.go`.
+
+---
+
+## Roadmap
+
+### Completed
+
+- PDF upload → extract → chunk → embed → Pinecone upsert
+- S3 storage + Postgres document metadata
+- List / delete documents across all three stores
+- RAG `/ask` with optional document scoping
+- Docker image with Poppler + Compose Postgres
+- CORS for local Vite and Netlify frontend
+
+### Upcoming
+
+- Database migrations on startup (or SQL migration files)
+- Auth / API keys for upload and delete
+- Async upload pipeline for large PDFs
+- `.env.example` and health checks for dependencies
+- Support for additional file types (TXT, DOCX)
+- Rate limiting and upload size limits
 
 ---
 
 ## License
 
-MIT (or your preferred license).
+MIT — free to use, modify, and distribute.
+
+---
+
+## Contact
+
+**Rohan Prasad Gupta**  
+Portfolio: [rohanpdgupta-portfolio.netlify.app](https://rohanpdgupta-portfolio.netlify.app)  
+GitHub: [@RohanPrasadGupta](https://github.com/RohanPrasadGupta)  
+Frontend: [golang-doc-ai.netlify.app](https://golang-doc-ai.netlify.app)
