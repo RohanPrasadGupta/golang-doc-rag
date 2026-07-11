@@ -3,7 +3,9 @@ package claude
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
+	"strings"
 
 	"github.com/anthropics/anthropic-sdk-go"
 	"github.com/anthropics/anthropic-sdk-go/option"
@@ -36,7 +38,7 @@ func Query(ctx context.Context, query string, matchesText string) (string, error
 		Model: "claude-haiku-4-5",
 	})
 	if err != nil {
-		panic(err.Error())
+		return "", fmt.Errorf("failed to query: %w", err)
 	}
 	var answer string
 	for _, block := range message.Content {
@@ -44,5 +46,209 @@ func Query(ctx context.Context, query string, matchesText string) (string, error
 			answer += textBlock.Text
 		}
 	}
+	return answer, nil
+}
+
+func QueryResumeExtraction(ctx context.Context, content string) (string, error) {
+	anthropicKey := os.Getenv("ANTHROPIC_API_KEY")
+	if anthropicKey == "" {
+		return "", errors.New("ANTHROPIC_API_KEY is not set")
+	}
+
+	client := anthropic.NewClient(
+		option.WithAPIKey(anthropicKey),
+	)
+
+	message, err := client.Messages.New(context.TODO(), anthropic.MessageNewParams{
+		MaxTokens: 4096,
+		System: []anthropic.TextBlockParam{
+			{Text: ExtractionSystem},
+		},
+		Messages: []anthropic.MessageParam{
+			anthropic.NewUserMessage(anthropic.NewTextBlock(content)),
+		},
+		Model: "claude-haiku-4-5",
+	})
+	if err != nil {
+		return "", fmt.Errorf("failed to query: %w", err)
+	}
+	var answer string
+	for _, block := range message.Content {
+		if textBlock, ok := block.AsAny().(anthropic.TextBlock); ok {
+			answer += textBlock.Text
+		}
+	}
+
+	if strings.TrimSpace(answer) == "" {
+		return "", fmt.Errorf("Claude returned no text content")
+	}
+
+	cleanJSON := cleanJSONResponse(answer)
+
+	return cleanJSON, nil
+
+}
+
+func cleanJSONResponse(input string) string {
+	input = strings.TrimSpace(input)
+
+	input = strings.TrimPrefix(input, "```json")
+	input = strings.TrimPrefix(input, "```JSON")
+	input = strings.TrimPrefix(input, "```")
+
+	input = strings.TrimSuffix(input, "```")
+
+	return strings.TrimSpace(input)
+}
+
+func QueryJDExtraction(ctx context.Context, content string) (string, error) {
+	anthropicKey := os.Getenv("ANTHROPIC_API_KEY")
+	if anthropicKey == "" {
+		return "", errors.New("ANTHROPIC_API_KEY is not set")
+	}
+
+	client := anthropic.NewClient(
+		option.WithAPIKey(anthropicKey),
+	)
+
+	message, err := client.Messages.New(context.TODO(), anthropic.MessageNewParams{
+		MaxTokens: 4096,
+		System: []anthropic.TextBlockParam{
+			{Text: JDExtractionSystem},
+		},
+		Messages: []anthropic.MessageParam{
+			anthropic.NewUserMessage(anthropic.NewTextBlock(content)),
+		},
+		Model: "claude-haiku-4-5",
+	})
+	if err != nil {
+		return "", fmt.Errorf("failed to query: %w", err)
+	}
+	var answer string
+	for _, block := range message.Content {
+		if textBlock, ok := block.AsAny().(anthropic.TextBlock); ok {
+			answer += textBlock.Text
+		}
+	}
+	return answer, nil
+}
+
+func QueryJDScoring(ctx context.Context, userInformationJSON string, jd string) (string, error) {
+	anthropicKey := os.Getenv("ANTHROPIC_API_KEY")
+	if anthropicKey == "" {
+		return "", errors.New("ANTHROPIC_API_KEY is not set")
+	}
+
+	client := anthropic.NewClient(
+		option.WithAPIKey(anthropicKey),
+	)
+
+	message, err := client.Messages.New(context.TODO(), anthropic.MessageNewParams{
+		MaxTokens: 4096,
+		System: []anthropic.TextBlockParam{
+			{Text: JDScoring},
+		},
+		Messages: []anthropic.MessageParam{
+			anthropic.NewUserMessage(anthropic.NewTextBlock(userInformationJSON + "\n\n" + jd)),
+		},
+		Model: "claude-haiku-4-5",
+	})
+	if err != nil {
+		return "", fmt.Errorf("failed to query: %w", err)
+	}
+	var answer string
+	for _, block := range message.Content {
+		if textBlock, ok := block.AsAny().(anthropic.TextBlock); ok {
+			answer += textBlock.Text
+		}
+	}
+	return answer, nil
+}
+
+func QueryJOBCoverLetter(ctx context.Context, userInformationJSON string, jd string) (string, error) {
+	anthropicKey := os.Getenv("ANTHROPIC_API_KEY")
+	if anthropicKey == "" {
+		return "", errors.New("ANTHROPIC_API_KEY is not set")
+	}
+
+	client := anthropic.NewClient(
+		option.WithAPIKey(anthropicKey),
+	)
+
+	message, err := client.Messages.New(context.TODO(), anthropic.MessageNewParams{
+		MaxTokens: 4096,
+		System: []anthropic.TextBlockParam{
+			{Text: JOBCoverLetterSystem},
+		},
+		Messages: []anthropic.MessageParam{
+			anthropic.NewUserMessage(anthropic.NewTextBlock(userInformationJSON + "\n\n" + jd)),
+		},
+		Model: "claude-haiku-4-5",
+	})
+	if err != nil {
+		return "", fmt.Errorf("failed to query: %w", err)
+	}
+	var answer string
+	for _, block := range message.Content {
+		if textBlock, ok := block.AsAny().(anthropic.TextBlock); ok {
+			answer += textBlock.Text
+		}
+	}
+	return answer, nil
+}
+
+func QueryNewResume(
+	ctx context.Context,
+	userInformationJSON string,
+	userUpdatesJSON string,
+	jd string,
+) (string, error) {
+	anthropicKey := os.Getenv("ANTHROPIC_API_KEY")
+	if anthropicKey == "" {
+		return "", errors.New("ANTHROPIC_API_KEY is not set")
+	}
+
+	client := anthropic.NewClient(
+		option.WithAPIKey(anthropicKey),
+	)
+
+	userPrompt := fmt.Sprintf(`
+USER_INFORMATION:
+%s
+
+USER_UPDATES:
+%s
+
+JOB_DESCRIPTION:
+%s
+
+Generate the updated ATS-friendly resume in LaTeX.
+`, userInformationJSON, userUpdatesJSON, jd)
+
+	message, err := client.Messages.New(ctx, anthropic.MessageNewParams{
+		MaxTokens: 4096,
+		System: []anthropic.TextBlockParam{
+			{Text: NEWResumeLatexBuilder},
+		},
+		Messages: []anthropic.MessageParam{
+			anthropic.NewUserMessage(
+				anthropic.NewTextBlock(userPrompt),
+			),
+		},
+		Model: "claude-haiku-4-5",
+	})
+
+	if err != nil {
+		return "", fmt.Errorf("failed to query: %w", err)
+	}
+
+	var answer string
+
+	for _, block := range message.Content {
+		if textBlock, ok := block.AsAny().(anthropic.TextBlock); ok {
+			answer += textBlock.Text
+		}
+	}
+
 	return answer, nil
 }
