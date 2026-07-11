@@ -20,9 +20,6 @@ func NewS3Storage() (*S3Storage, error) {
 	region := os.Getenv("AWS_REGION")
 	bucket := os.Getenv("AWS_BUCKET")
 
-	// This one stays context.Background() — it runs ONCE at startup,
-	// not per-request, so there's no request context to thread here.
-
 	cfg, err := config.LoadDefaultConfig(context.Background(), config.WithRegion(region))
 	if err != nil {
 		return nil, err
@@ -37,8 +34,17 @@ func NewS3Storage() (*S3Storage, error) {
 }
 
 // Save now takes ctx and forwards it to PutObject.
-func (s *S3Storage) Save(ctx context.Context, id string, data io.Reader) (string, error) {
-	key := fmt.Sprintf("documents/%s", id)
+func (s *S3Storage) Save(ctx context.Context, id string, data io.Reader, uploadType string) (string, error) {
+	var key string
+
+	switch uploadType {
+	case "document":
+		key = fmt.Sprintf("documents/%s", id)
+	case "resume_analysis":
+		key = fmt.Sprintf("resume_analysis/%s", id)
+	default:
+		return "", fmt.Errorf("invalid type: %s", uploadType)
+	}
 
 	_, err := s.Client.PutObject(ctx, &s3.PutObjectInput{
 		Bucket: aws.String(s.Bucket),
