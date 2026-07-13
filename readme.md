@@ -821,10 +821,12 @@ Supports both “search everything” and “chat with this PDF” without separ
 MIT — free to use, modify, and distribute.
 
 ---
+## Related
+
+- Frontend: [`golang-doc-rag-frontend`](https://github.com/RohanPrasadGupta/golang-doc-rag-frontend)
 
 ## Contact
 
 **Rohan Prasad Gupta**  
 Portfolio: [rohanpdgupta-portfolio.netlify.app](https://rohanpdgupta-portfolio.netlify.app)  
-GitHub: [@RohanPrasadGupta](https://github.com/RohanPrasadGupta)  
-Frontend: [golang-doc-ai.netlify.app](https://golang-doc-ai.netlify.app)
+GitHub: [@RohanPrasadGupta](https://github.com/RohanPrasadGupta)
