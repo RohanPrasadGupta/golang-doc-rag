@@ -5,6 +5,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"time"
 
 	"github.com/RohanPrasadGupta/golang-doc-rag/internal/config"
 	"github.com/RohanPrasadGupta/golang-doc-rag/internal/database"
@@ -17,7 +18,6 @@ func main() {
 	config.LoadConfig()
 
 	store, err := storage.NewS3Storage()
-
 	if err != nil {
 		log.Fatal("failed to create S3 storage:", err)
 	}
@@ -39,8 +39,14 @@ func main() {
 		port = "8080"
 	}
 
-	log.Printf("server starting on port %s", port)
-	log.Fatal(http.ListenAndServe(":"+port, srv))
+	httpServer := &http.Server{
+		Addr:         ":" + port,
+		Handler:      srv,
+		ReadTimeout:  30 * time.Second,
+		WriteTimeout: 2 * time.Minute,
+		IdleTimeout:  60 * time.Second,
+	}
 
-	// http.ListenAndServe(":"+port, srv)
+	log.Printf("server starting on port %s", port)
+	log.Fatal(httpServer.ListenAndServe())
 }
