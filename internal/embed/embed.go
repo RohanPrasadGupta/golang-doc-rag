@@ -8,9 +8,23 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"time"
 )
 
-const voyageEmbeddingsURL = "https://api.voyageai.com/v1/embeddings"
+const (
+	voyageEmbeddingsURL = "https://api.voyageai.com/v1/embeddings"
+	defaultModel        = "voyage-4-lite"
+	maxBatchSize        = 128
+)
+
+const (
+	InputTypeDocument = "document"
+	InputTypeQuery    = "query"
+)
+
+var httpClient = &http.Client{
+	Timeout: 60 * time.Second,
+}
 
 type voyageEmbeddingRequest struct {
 	Input     []string `json:"input"`
@@ -27,38 +41,65 @@ type voyageEmbeddingResponse struct {
 	Data []voyageEmbeddingData `json:"data"`
 }
 
-func EmbedTexts(ctx context.Context, texts []string) ([][]float64, error) {
-	vougeApi := os.Getenv("VOYAGE_API_KEY")
+// EmbedTexts embeds texts with Voyage. inputType should be InputTypeDocument or InputTypeQuery.
+func EmbedTexts(ctx context.Context, texts []string, inputType string) ([][]float64, error) {
+	if len(texts) == 0 {
+		return nil, nil
+	}
 
-	if vougeApi == "" {
+	voyageAPIKey := os.Getenv("VOYAGE_API_KEY")
+	if voyageAPIKey == "" {
 		return nil, errors.New("VOYAGE_API_KEY is not set")
 	}
 
+	if inputType == "" {
+		inputType = InputTypeDocument
+	}
+
+	all := make([][]float64, len(texts))
+
+	for start := 0; start < len(texts); start += maxBatchSize {
+		end := start + maxBatchSize
+		if end > len(texts) {
+			end = len(texts)
+		}
+
+		batch, err := embedBatch(ctx, voyageAPIKey, texts[start:end], inputType)
+		if err != nil {
+			return nil, err
+		}
+
+		copy(all[start:end], batch)
+	}
+
+	return all, nil
+}
+
+func embedBatch(ctx context.Context, apiKey string, texts []string, inputType string) ([][]float64, error) {
 	requestBody := voyageEmbeddingRequest{
 		Input:     texts,
-		Model:     "voyage-4-lite",
-		InputType: "document",
+		Model:     defaultModel,
+		InputType: inputType,
 	}
 	body, err := json.Marshal(requestBody)
 	if err != nil {
 		return nil, fmt.Errorf("failed to marshal request body: %w", err)
 	}
+
 	req, err := http.NewRequestWithContext(
 		ctx,
 		http.MethodPost,
 		voyageEmbeddingsURL,
 		bytes.NewBuffer(body),
 	)
-
 	if err != nil {
 		return nil, fmt.Errorf("failed to create request: %w", err)
 	}
 
-	req.Header.Set("Authorization", "Bearer "+vougeApi)
+	req.Header.Set("Authorization", "Bearer "+apiKey)
 	req.Header.Set("Content-Type", "application/json")
 
-	client := &http.Client{}
-	resp, err := client.Do(req)
+	resp, err := httpClient.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("failed to send request: %w", err)
 	}
@@ -72,13 +113,11 @@ func EmbedTexts(ctx context.Context, texts []string) ([][]float64, error) {
 	}
 
 	var response voyageEmbeddingResponse
-
 	if err := json.NewDecoder(resp.Body).Decode(&response); err != nil {
 		return nil, fmt.Errorf("decode embedding response: %w", err)
 	}
 
-	embeddings := make([][]float64, len(response.Data))
-
+	embeddings := make([][]float64, len(texts))
 	for _, item := range response.Data {
 		if item.Index < 0 || item.Index >= len(embeddings) {
 			return nil, fmt.Errorf(
@@ -86,11 +125,14 @@ func EmbedTexts(ctx context.Context, texts []string) ([][]float64, error) {
 				item.Index,
 			)
 		}
-
 		embeddings[item.Index] = item.Embedding
 	}
-	// log.Printf("embedded %d chunks, first vector has %d dimensions", len(embeddings), len(embeddings[0]))
-	// log.Printf("first vector: %v", embeddings[0])
+
+	for i, emb := range embeddings {
+		if emb == nil {
+			return nil, fmt.Errorf("missing embedding for index %d", i)
+		}
+	}
 
 	return embeddings, nil
 }

@@ -54,6 +54,8 @@ func NewPinecone(ctx context.Context) (*PineconeStore, error) {
 	return &PineconeStore{client: client, index: index}, nil
 }
 
+const upsertBatchSize = 100
+
 func (p *PineconeStore) Upsert(
 	ctx context.Context,
 	documentID string,
@@ -67,35 +69,44 @@ func (p *PineconeStore) Upsert(
 		)
 	}
 
-	vectors := make([]*pinecone.Vector, 0, len(embeddings))
+	var totalUpserted uint32
 
-	for i := range embeddings {
-		values := make([]float32, len(embeddings[i]))
-		for j, v := range embeddings[i] {
-			values[j] = float32(v)
+	for start := 0; start < len(embeddings); start += upsertBatchSize {
+		end := start + upsertBatchSize
+		if end > len(embeddings) {
+			end = len(embeddings)
 		}
 
-		metadata, err := structpb.NewStruct(map[string]interface{}{
-			"text":        chunks[i],
-			"document_id": documentID,
-		})
+		vectors := make([]*pinecone.Vector, 0, end-start)
+		for i := start; i < end; i++ {
+			values := make([]float32, len(embeddings[i]))
+			for j, v := range embeddings[i] {
+				values[j] = float32(v)
+			}
+
+			metadata, err := structpb.NewStruct(map[string]interface{}{
+				"text":        chunks[i],
+				"document_id": documentID,
+			})
+			if err != nil {
+				return fmt.Errorf("build metadata for chunk %d: %w", i, err)
+			}
+
+			vectors = append(vectors, &pinecone.Vector{
+				Id:       fmt.Sprintf("%s-%d", documentID, i),
+				Values:   &values,
+				Metadata: metadata,
+			})
+		}
+
+		count, err := p.index.UpsertVectors(ctx, vectors)
 		if err != nil {
-			return fmt.Errorf("build metadata for chunk %d: %w", i, err)
+			return fmt.Errorf("upsert vectors: %w", err)
 		}
-
-		vectors = append(vectors, &pinecone.Vector{
-			Id:       fmt.Sprintf("%s-%d", documentID, i),
-			Values:   &values, // *[]float32 in go-pinecone v3
-			Metadata: metadata,
-		})
+		totalUpserted += count
 	}
 
-	count, err := p.index.UpsertVectors(ctx, vectors)
-	if err != nil {
-		return fmt.Errorf("upsert vectors: %w", err)
-	}
-
-	log.Printf("upserted %d vectors for document %s", count, documentID)
+	log.Printf("upserted %d vectors for document %s", totalUpserted, documentID)
 	return nil
 }
 
@@ -175,41 +186,5 @@ func (p *PineconeStore) UpsertResumeAnalysis(
 	chunks []string,
 	embeddings [][]float64,
 ) error {
-	if len(chunks) != len(embeddings) {
-		return fmt.Errorf(
-			"chunk/embedding count mismatch: %d chunks, %d embeddings",
-			len(chunks), len(embeddings),
-		)
-	}
-
-	vectors := make([]*pinecone.Vector, 0, len(embeddings))
-
-	for i := range embeddings {
-		values := make([]float32, len(embeddings[i]))
-		for j, v := range embeddings[i] {
-			values[j] = float32(v)
-		}
-
-		metadata, err := structpb.NewStruct(map[string]interface{}{
-			"text":        chunks[i],
-			"document_id": documentID,
-		})
-		if err != nil {
-			return fmt.Errorf("build metadata for chunk %d: %w", i, err)
-		}
-
-		vectors = append(vectors, &pinecone.Vector{
-			Id:       fmt.Sprintf("%s-%d", documentID, i),
-			Values:   &values, // *[]float32 in go-pinecone v3
-			Metadata: metadata,
-		})
-	}
-
-	count, err := p.index.UpsertVectors(ctx, vectors)
-	if err != nil {
-		return fmt.Errorf("upsert vectors: %w", err)
-	}
-
-	log.Printf("[Resume Analysis] upserted %d vectors for document %s", count, documentID)
-	return nil
+	return p.Upsert(ctx, documentID, chunks, embeddings)
 }
